@@ -1,4 +1,4 @@
-﻿# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
 # and proprietary rights in and to this software, related documentation
@@ -14,6 +14,7 @@ from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops import bias_act
 from torch_utils.ops import fma
+from torch_xla._patched_functions import *
 
 #----------------------------------------------------------------------------
 
@@ -22,6 +23,7 @@ def normalize_2nd_moment(x, dim=1, eps=1e-8):
     return x * (x.square().mean(dim=dim, keepdim=True) + eps).rsqrt()
 
 #----------------------------------------------------------------------------
+
 
 @misc.profiled_function
 def modulated_conv2d(
@@ -85,6 +87,7 @@ def modulated_conv2d(
 
 #----------------------------------------------------------------------------
 
+    
 @persistence.persistent_class
 class FullyConnectedLayer(torch.nn.Module):
     def __init__(self,
@@ -231,7 +234,7 @@ class MappingNetwork(torch.nn.Module):
         # Update moving average of W.
         if self.w_avg_beta is not None and self.training and not skip_w_avg_update:
             with torch.autograd.profiler.record_function('update_w_avg'):
-                self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+                self.w_avg.copy_((1-self.w_avg_beta)*x.detach().mean(dim=0) +  self.w_avg_beta*self.w_avg)
 
         # Broadcast.
         if self.num_ws is not None:
@@ -239,13 +242,13 @@ class MappingNetwork(torch.nn.Module):
                 x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
 
         # Apply truncation.
-        if truncation_psi != 1:
-            with torch.autograd.profiler.record_function('truncate'):
-                assert self.w_avg_beta is not None
-                if self.num_ws is None or truncation_cutoff is None:
-                    x = self.w_avg.lerp(x, truncation_psi)
-                else:
-                    x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+#         if truncation_psi != 1:
+#             with torch.autograd.profiler.record_function('truncate'):
+#                 assert self.w_avg_beta is not None
+#                 if self.num_ws is None or truncation_cutoff is None:
+#                     x = self.w_avg.lerp(x, truncation_psi)
+#                 else:
+#                     x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
         return x
 
 #----------------------------------------------------------------------------
@@ -472,6 +475,18 @@ class SynthesisNetwork(torch.nn.Module):
         return img
 
 #----------------------------------------------------------------------------
+class EMA():
+    def __init__(self):
+        super().__init__()
+        
+    def update_average(self, beta, old, new ):
+        if old is None:
+            return new
+        return old * beta + (1 - beta) * new
+    
+#----------------------------------------------------------------------------
+
+
 
 @persistence.persistent_class
 class Generator(torch.nn.Module):
@@ -494,6 +509,30 @@ class Generator(torch.nn.Module):
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
+        self.synthesis_ema = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.mapping_ema = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+        self.ema_updater = EMA()
+        
+        for p in self.synthesis_ema.parameters():
+            p.requires_grad = False
+        for p in self.mapping_ema.parameters():
+            p.requires_grad = False
+        
+    def EMA(self , beta):
+        def update_moving_average(beta, ma_model, current_model):
+            for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+                old_weight, up_weight = ma_params.data, current_params.data
+                ma_params.data = self.ema_updater.update_average(beta, old_weight, up_weight)
+
+        update_moving_average(beta, self.synthesis_ema, self.synthesis)
+        update_moving_average(beta, self.mapping_ema, self.mapping)
+
+    def clipgrad(self , min=-1e5, max=1e5):
+        clip_grad_norm_(self.synthesis.parameters() , max_norm = 1e5 , norm_type = np.inf)
+        clip_grad_norm_(self.mapping.parameters() , max_norm = 1e5 , norm_type = np.inf)
+           
+
+    
     def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, **synthesis_kwargs):
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff)
         img = self.synthesis(ws, **synthesis_kwargs)
@@ -542,10 +581,10 @@ class DiscriminatorBlock(torch.nn.Module):
         if in_channels == 0 or architecture == 'skip':
             self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
                 trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
-
+        
         self.conv0 = Conv2dLayer(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
             trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
-
+        
         self.conv1 = Conv2dLayer(tmp_channels, out_channels, kernel_size=3, activation=activation, down=2,
             trainable=next(trainable_iter), resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last)
 
@@ -727,3 +766,4 @@ class Discriminator(torch.nn.Module):
         return x
 
 #----------------------------------------------------------------------------
+
