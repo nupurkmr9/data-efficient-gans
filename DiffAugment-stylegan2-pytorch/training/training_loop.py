@@ -137,7 +137,7 @@ def training_loop(
     device = xm.xla_device()
     rank = xm.get_ordinal()
     start_time = time.time()
-#     save_path = 
+    save_path = 'gs://ganbucker/'
     
     stats_tfevents = None
     if xm.is_master_ordinal():
@@ -232,7 +232,6 @@ def training_loop(
             training_set_iterator =  training_set_parallel_loader.per_device_loader(device)
             phase_real_img, phase_real_c = next(training_set_iterator)
        
-        xm.master_print(phase_real_img.size())
         phase_real_img = (phase_real_img.to(torch.float32) / 127.5 - 1).to(device)
         phase_real_c = phase_real_c.to(device)
         all_gen_z = torch.randn((2 * batch_gpu, G.z_dim), device=device).split(batch_gpu)
@@ -260,14 +259,14 @@ def training_loop(
             # Update weights.
             phase.module.requires_grad_(False)
             #gradient clipping sentence here
-#             xm.reduce_gradients(phase.opt)
-#             xm.master_print("grad norm clipping")
-#             phase.module.clipgrad()
-#             phase.opt.step()
-            xm.optimizer_step(phase.opt)
+            xm.reduce_gradients(phase.opt)
+            xm.master_print("grad norm clipping")
+            phase.module.clipgrad()
+            phase.opt.step()
+#             xm.optimizer_step(phase.opt)
             xm.mark_step()
             
-        print(met.metrics_report())
+#         print(met.metrics_report())
 
         # Update G_ema.
         ema_nimg = ema_kimg * 1000
@@ -339,5 +338,6 @@ def training_loop(
         print('Exiting...')
 
 #----------------------------------------------------------------------------
+
 
 
